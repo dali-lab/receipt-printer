@@ -85,9 +85,10 @@ SHARPEN_PERCENT = 150
 SHARPEN_RADIUS  = 2
 
 DENOISE         = True
-DENOISE_RADIUS  = 3        # bilateral spatial sigma (pixels); 3-7 works well
-DENOISE_SIGMA   = 20       # bilateral intensity sigma; higher = smoother flat areas
-                           # raise to 40 for heavy noise, lower to 10 to preserve micro-detail
+DENOISE_METHOD  = "nlmeans"   # "nlmeans" | "bilateral" | "median"
+DENOISE_H       = 12          # nlmeans: filter strength (5=light, 10=normal, 15=heavy)
+DENOISE_RADIUS  = 3           # bilateral: spatial sigma; nlmeans: unused
+DENOISE_SIGMA   = 20          # bilateral: intensity sigma; nlmeans: unused
 
 DITHER = "atkinson"        # "atkinson" | "floyd" | "threshold"
 
@@ -107,13 +108,18 @@ def clahe(gray):
 
 
 def denoise(gray):
-    """Bilateral filter: smooths sensor noise while preserving edges.
-    Falls back to a 3x3 median filter if OpenCV is missing."""
     try:
         import cv2
         arr = np.asarray(gray, np.uint8)
-        d = DENOISE_RADIUS * 2 + 1   # kernel diameter (odd)
-        out = cv2.bilateralFilter(arr, d, DENOISE_SIGMA, DENOISE_SIGMA)
+        if DENOISE_METHOD == "nlmeans":
+            # Non-local means: best at removing grain without blurring edges.
+            # templateWindowSize=7, searchWindowSize=21 are good defaults for photos.
+            out = cv2.fastNlMeansDenoising(arr, h=DENOISE_H,
+                                           templateWindowSize=7,
+                                           searchWindowSize=21)
+        else:
+            d = DENOISE_RADIUS * 2 + 1
+            out = cv2.bilateralFilter(arr, d, DENOISE_SIGMA, DENOISE_SIGMA)
         return Image.fromarray(out, "L")
     except ImportError:
         return gray.filter(ImageFilter.MedianFilter(size=3))
