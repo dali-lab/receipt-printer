@@ -2,17 +2,31 @@
 """
 receipt_photo.py
 ----------------
-Press a button -> Pi Camera takes a photo -> the photo is tone-mapped and
-dithered for a 1-bit thermal head -> printed on an Epson TM-T88V (USB).
+Press a button -> LED-matrix flash fires -> Pi Camera takes a photo ->
+the photo is tone-mapped and dithered for a 1-bit thermal head ->
+printed on an Epson TM-T88V (USB).
 
 Quality pipeline:
   grayscale -> resize -> CLAHE (adaptive local equalization) ->
   (auto)gamma tone map -> clarity -> unsharp edges -> serpentine Atkinson dither.
 
+Flash:
+  MAX7219 8x8 LED matrix over SPI. Lights before capture, gives the camera
+  a beat to adjust exposure, then turns off (flash sync). Degrades gracefully
+  to no-flash if the matrix isn't connected / libraries aren't installed.
+
+Setup (one time):
+  sudo raspi-config nonint do_spi 0 && sudo reboot
+  uv pip install luma.led_matrix spidev rpi-lgpio
+
 Usage:
   Live (waits for button):              python3 receipt_photo.py
   Test one capture+print immediately:   python3 receipt_photo.py --test
   Print an existing image (no camera):  python3 receipt_photo.py path/to/img.jpg
+
+Wiring (MAX7219 matrix -> Pi, hardware SPI):
+  VCC->5V(pin 2)  GND->GND(pin 6)  DIN->GPIO10/MOSI(pin 19)
+  CS->GPIO8/CE0(pin 24)  CLK->GPIO11/SCLK(pin 23)
 """
 
 import sys
@@ -40,26 +54,33 @@ IMAGE_IMPL       = "bitImageRaster"
 BUTTON_GPIO   = 17
 BUTTON_PULLUP = False
 ROTATE_DEGREES = 0
-CAMERA_SETTLE  = 1.5
+CAMERA_SETTLE  = 1.5       # seconds to settle when the camera first starts
+
+# ----------------------------------------------------------------------------
+# FLASH CONFIG (MAX7219 8x8 LED matrix over SPI)
+# ----------------------------------------------------------------------------
+FLASH_ENABLED   = True
+FLASH_SPI_PORT  = 0        # /dev/spidev0.0  -> port 0, device 0
+FLASH_SPI_DEV   = 0
+FLASH_CASCADED  = 1        # number of chained 8x8 panels
+FLASH_BRIGHTNESS = 255     # 0-255 (contrast)
+FLASH_SETTLE    = 0.4      # seconds the light is on before capture, so
+                           # auto-exposure adapts to the lit scene
 
 # ----------------------------------------------------------------------------
 # IMAGE QUALITY KNOBS
 # ----------------------------------------------------------------------------
-# CLAHE: adaptive local contrast (the main detail step)
-CLAHE_CLIP  = 2.0          # higher = stronger local contrast (2-4 typical); too high = noisy
-CLAHE_TILES = 8            # grid is TILES x TILES; more tiles = more local
-CONTRAST_CUTOFF = 2        # only used by the fallback if OpenCV is missing
+CLAHE_CLIP  = 2.0          # local contrast strength (2-4); too high = noisy
+CLAHE_TILES = 8
+CONTRAST_CUTOFF = 2        # fallback only, if OpenCV missing
 
-# Tone mapping (dot-gain compensation)
 AUTO_GAMMA   = True
-GAMMA_TARGET = 0.60        # target mean brightness (0..1); higher = lighter print
+GAMMA_TARGET = 0.60        # target mean brightness (0..1); higher = lighter
 GAMMA        = 1.5         # used only when AUTO_GAMMA = False
 
-# Clarity (mid-frequency detail; CLAHE already adds local contrast, so keep modest)
 LOCAL_CONTRAST_AMOUNT = 0.35
 LOCAL_CONTRAST_RADIUS = 12
 
-# Edge sharpening
 SHARPEN_PERCENT = 150
 SHARPEN_RADIUS  = 2
 
@@ -70,8 +91,7 @@ DITHER = "atkinson"        # "atkinson" | "floyd" | "threshold"
 # ----------------------------------------------------------------------------
 
 def clahe(gray):
-    """Contrast-limited adaptive histogram equalization (per-tile local contrast).
-    Falls back to global autocontrast if OpenCV isn't installed."""
+    """Adaptive local contrast. Falls back to global autocontrast w/o OpenCV."""
     try:
         import cv2
     except ImportError:
@@ -159,6 +179,51 @@ def prepare_image(img):
 
 
 # ----------------------------------------------------------------------------
+# FLASH (MAX7219 LED matrix)
+# ----------------------------------------------------------------------------
+
+class Flash:
+    """LED-matrix flash. If anything is missing/unconnected, on()/off() become
+    no-ops so the rest of the program keeps working."""
+
+    def __init__(self):
+        self.device = None
+        if not FLASH_ENABLED:
+            return
+        try:
+            from luma.led_matrix.device import max7219
+            from luma.core.interface.serial import spi, noop
+            serial = spi(port=FLASH_SPI_PORT, device=FLASH_SPI_DEV, gpio=noop())
+            self.device = max7219(serial, cascaded=FLASH_CASCADED)
+            self.device.contrast(FLASH_BRIGHTNESS)
+            self.device.clear()
+        except Exception as e:
+            print(f"Flash disabled (matrix not available): {e}")
+            self.device = None
+
+    def on(self):
+        if self.device is None:
+            return
+        try:
+            from luma.core.render import canvas
+            with canvas(self.device) as draw:
+                draw.rectangle(self.device.bounding_box, fill="white")
+        except Exception:
+            pass
+
+    def off(self):
+        if self.device is None:
+            return
+        try:
+            self.device.clear()
+        except Exception:
+            pass
+
+    def close(self):
+        self.off()
+
+
+# ----------------------------------------------------------------------------
 # PRINTER
 # ----------------------------------------------------------------------------
 
@@ -211,19 +276,25 @@ class Camera:
 
 _busy = threading.Lock()
 
-def handle_press(camera):
+def handle_press(camera, flash):
     if not _busy.acquire(blocking=False):
         print("Still printing the last one -- ignoring press.")
         return
     try:
-        print("Capturing...")
-        raw = camera.capture()
+        print("Flash on, capturing...")
+        flash.on()
+        time.sleep(FLASH_SETTLE)        # let auto-exposure adapt to the light
+        try:
+            raw = camera.capture()
+        finally:
+            flash.off()
         img = prepare_image(raw)
         print(f"Printing {img.width}x{img.height} ...")
         print_image(img)
         print("Done.")
     except Exception as e:
         print(f"Error during capture/print: {e}")
+        flash.off()
     finally:
         _busy.release()
 
@@ -233,8 +304,9 @@ def run_live():
     from signal import pause
 
     camera = Camera()
+    flash = Flash()
     button = Button(BUTTON_GPIO, pull_up=BUTTON_PULLUP)
-    button.when_pressed = lambda: handle_press(camera)
+    button.when_pressed = lambda: handle_press(camera, flash)
 
     print(f"Ready. Press the button on GPIO{BUTTON_GPIO} to take + print a photo.")
     print("Ctrl+C to quit.")
@@ -243,24 +315,31 @@ def run_live():
     except KeyboardInterrupt:
         pass
     finally:
+        flash.close()
         camera.close()
         print("\nExiting.")
 
 
 def main():
     args = sys.argv[1:]
+
     if args and args[0] != "--test":
+        # Print an existing image file (no camera, no flash)
         print(f"Preparing and printing {args[0]} ...")
         print_image(prepare_image(Image.open(args[0])))
         print("Done.")
         return
+
     if args and args[0] == "--test":
         camera = Camera()
+        flash = Flash()
         try:
-            handle_press(camera)
+            handle_press(camera, flash)
         finally:
+            flash.close()
             camera.close()
         return
+
     run_live()
 
 
