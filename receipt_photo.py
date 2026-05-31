@@ -2,15 +2,12 @@
 """
 receipt_photo.py
 ----------------
-Press a button -> Pi Camera takes a photo -> photo is converted to a
-1-bit dithered image at the printer's working width -> printed on an
-80mm USB ESC/POS thermal receipt printer.
+Press a button -> Pi Camera takes a photo -> the photo is tone-mapped and
+dithered for a 1-bit thermal head -> printed on an Epson TM-T88V (USB).
 
-Hardware assumptions:
-  * Raspberry Pi Camera Module (CSI ribbon) -> uses picamera2
-  * 80mm thermal printer over USB, ESC/POS compatible -> uses python-escpos
-  * Momentary push button wired between a GPIO pin and GND (gpiozero
-    default is internal pull-up, so no extra resistor needed)
+Image quality pipeline (the part that actually matters on a 1-bit printer):
+  grayscale -> autocontrast -> resize to head width -> gamma tone map
+  (dot-gain compensation) -> unsharp pre-sharpen -> dither.
 
 Usage:
   Live mode (waits for button presses):   python3 receipt_photo.py
@@ -22,58 +19,105 @@ import sys
 import time
 import threading
 
-from PIL import Image, ImageOps
+import numpy as np
+from PIL import Image, ImageOps, ImageFilter
 
 # ----------------------------------------------------------------------------
-# CONFIG  -- edit these to match your setup
+# PRINTER CONFIG  (confirmed for this TM-T88V)
 # ----------------------------------------------------------------------------
+PRINTER_VENDOR_ID  = 0x04b8
+PRINTER_PRODUCT_ID = 0x0202
+PRINTER_PROFILE    = "TM-T88V"
 
-# USB printer vendor/product IDs. Find yours by running `lsusb` in a terminal:
-#   e.g. "Bus 001 Device 005: ID 0416:5011 ..."  ->  VENDOR=0x0416 PRODUCT=0x5011
-PRINTER_VENDOR_ID  = 0x0416
-PRINTER_PRODUCT_ID = 0x5011
-# Some printers also need a profile, e.g. PRINTER_PROFILE = "TM-T88V".
-PRINTER_PROFILE    = None
+# The TM-T88V is a 180-dpi head: 512 printable dots (NOT 576 like 203-dpi units).
+PRINT_WIDTH = 512
 
-# GPIO pin (BCM numbering) the button is connected to. GPIO17 = physical pin 11.
-BUTTON_GPIO = 17
-
-# Printable width in dots. 80mm heads almost always have a 72mm printable
-# area at 203 dpi = 576 dots. (58mm printers would be 384.)
-PRINT_WIDTH = 576
-
-# Image tuning ---------------------------------------------------------------
-ROTATE_DEGREES   = 0      # rotate the photo if the camera is mounted sideways (0/90/180/270)
-AUTO_CONTRAST    = True   # stretch contrast -- helps a lot on thermal paper
-CONTRAST_CUTOFF  = 2      # percent of darkest/lightest pixels to clip for autocontrast
-FEED_LINES_AFTER = 3      # blank lines fed after the image before the cut
-CUT_PAPER        = True   # set False if your printer has no auto-cutter
+FEED_LINES_AFTER = 3
+CUT_PAPER        = True
+IMAGE_IMPL       = "bitImageRaster"   # known-good on this printer
 
 # ----------------------------------------------------------------------------
-# IMAGE PROCESSING
+# BUTTON / CAMERA CONFIG
+# ----------------------------------------------------------------------------
+BUTTON_GPIO   = 17
+BUTTON_PULLUP = False   # 3-pin Adeept module drives the pin HIGH on press
+
+ROTATE_DEGREES = 0      # 0/90/180/270 if the camera is mounted rotated
+
+# ----------------------------------------------------------------------------
+# IMAGE QUALITY KNOBS  -- tune these to taste
+# ----------------------------------------------------------------------------
+AUTO_CONTRAST   = True      # normalize tonal range before mapping
+CONTRAST_CUTOFF = 2         # % of darkest/lightest pixels to clip
+
+GAMMA = 1.5                 # TONE MAP: >1.0 lightens midtones to counter dot gain.
+                            #   Too dark -> raise (1.6-2.0). Too washed out -> lower.
+
+SHARPEN_PERCENT = 150       # unsharp strength; 0 disables. 100-200 is a good range.
+SHARPEN_RADIUS  = 2
+
+DITHER = "atkinson"         # "atkinson" (crisp/light), "floyd" (Pillow default), "threshold"
+
+# ----------------------------------------------------------------------------
+# TONE MAPPING + DITHERING
 # ----------------------------------------------------------------------------
 
-def prepare_image(img: Image.Image) -> Image.Image:
-    """Turn any input image into a 576px-wide, 1-bit dithered image ready to print."""
-    # Respect EXIF orientation (phones/cameras often store rotation as metadata)
+def apply_gamma(gray, gamma):
+    """Lift midtones to compensate for thermal dot gain. gamma>1 => lighter."""
+    arr = np.asarray(gray, dtype=np.float32) / 255.0
+    arr = np.power(arr, 1.0 / gamma)
+    return Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8), mode="L")
+
+
+def atkinson_dither(gray):
+    """Atkinson error-diffusion: diffuses only 6/8 of the error, so highlights
+    stay clean and the print comes out lighter and crisper than Floyd-Steinberg."""
+    arr = np.asarray(gray, dtype=np.float32).copy()
+    h, w = arr.shape
+    neighbours = ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2))
+    for y in range(h):
+        for x in range(w):
+            old = arr[y, x]
+            new = 255.0 if old >= 128 else 0.0
+            arr[y, x] = new
+            err = (old - new) / 8.0
+            for dx, dy in neighbours:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    arr[ny, nx] += err
+    out = np.where(arr >= 128, 255, 0).astype(np.uint8)
+    return Image.fromarray(out, mode="L").convert("1")
+
+
+def prepare_image(img):
     img = ImageOps.exif_transpose(img)
-
     if ROTATE_DEGREES:
         img = img.rotate(ROTATE_DEGREES, expand=True)
 
-    # To grayscale
     img = img.convert("L")
 
     if AUTO_CONTRAST:
         img = ImageOps.autocontrast(img, cutoff=CONTRAST_CUTOFF)
 
-    # Resize to the printer's width, keeping aspect ratio
+    # Resize to the head width first, then map/sharpen at final resolution
     w, h = img.size
     new_h = max(1, round(h * (PRINT_WIDTH / w)))
     img = img.resize((PRINT_WIDTH, new_h), Image.LANCZOS)
 
-    # Floyd-Steinberg dither down to 1-bit (this is what gives the "grayscale" look)
-    img = img.convert("1")
+    if GAMMA and GAMMA != 1.0:
+        img = apply_gamma(img, GAMMA)
+
+    if SHARPEN_PERCENT:
+        img = img.filter(ImageFilter.UnsharpMask(
+            radius=SHARPEN_RADIUS, percent=SHARPEN_PERCENT, threshold=2))
+
+    if DITHER == "atkinson":
+        img = atkinson_dither(img)
+    elif DITHER == "floyd":
+        img = img.convert("1")
+    else:  # plain threshold
+        img = img.point(lambda p: 255 if p >= 128 else 0).convert("1")
+
     return img
 
 
@@ -82,20 +126,15 @@ def prepare_image(img: Image.Image) -> Image.Image:
 # ----------------------------------------------------------------------------
 
 def get_printer():
-    """Open the USB ESC/POS printer."""
     from escpos.printer import Usb
-    kwargs = {}
-    if PRINTER_PROFILE:
-        kwargs["profile"] = PRINTER_PROFILE
+    kwargs = {"profile": PRINTER_PROFILE} if PRINTER_PROFILE else {}
     return Usb(PRINTER_VENDOR_ID, PRINTER_PRODUCT_ID, **kwargs)
 
 
-def print_image(img: Image.Image):
-    """Send a prepared PIL image to the printer."""
+def print_image(img):
     printer = get_printer()
     try:
-        # bitImageRaster is the most widely compatible raster mode
-        printer.image(img, impl="bitImageRaster")
+        printer.image(img, impl=IMAGE_IMPL)
         if FEED_LINES_AFTER:
             printer.print_and_feed(FEED_LINES_AFTER)
         if CUT_PAPER:
@@ -112,19 +151,14 @@ def print_image(img: Image.Image):
 # ----------------------------------------------------------------------------
 
 class Camera:
-    """Thin wrapper around picamera2 that stays warm between shots."""
-
     def __init__(self):
         from picamera2 import Picamera2
         self.cam = Picamera2()
-        # A still config gives you the full sensor resolution.
-        config = self.cam.create_still_configuration()
-        self.cam.configure(config)
+        self.cam.configure(self.cam.create_still_configuration())
         self.cam.start()
-        time.sleep(1.0)  # let auto-exposure / white balance settle
+        time.sleep(1.0)  # let exposure / white balance settle
 
-    def capture(self) -> Image.Image:
-        # capture_image returns a PIL Image directly (no temp file needed)
+    def capture(self):
         return self.cam.capture_image("main")
 
     def close(self):
@@ -138,10 +172,9 @@ class Camera:
 # MAIN FLOW
 # ----------------------------------------------------------------------------
 
-# Guard so a second press while we're still printing is ignored
 _busy = threading.Lock()
 
-def handle_press(camera: Camera):
+def handle_press(camera):
     if not _busy.acquire(blocking=False):
         print("Still printing the last one -- ignoring press.")
         return
@@ -163,7 +196,7 @@ def run_live():
     from signal import pause
 
     camera = Camera()
-    button = Button(BUTTON_GPIO)  # default: pull-up, wire button to GND
+    button = Button(BUTTON_GPIO, pull_up=BUTTON_PULLUP)
     button.when_pressed = lambda: handle_press(camera)
 
     print(f"Ready. Press the button on GPIO{BUTTON_GPIO} to take + print a photo.")
@@ -180,15 +213,12 @@ def run_live():
 def main():
     args = sys.argv[1:]
 
-    # Print an existing image file, no camera involved
-    if args and args[0] not in ("--test",):
-        path = args[0]
-        print(f"Preparing and printing {path} ...")
-        print_image(prepare_image(Image.open(path)))
+    if args and args[0] != "--test":
+        print(f"Preparing and printing {args[0]} ...")
+        print_image(prepare_image(Image.open(args[0])))
         print("Done.")
         return
 
-    # One-shot capture+print, useful for testing the camera+printer chain
     if args and args[0] == "--test":
         camera = Camera()
         try:
@@ -197,7 +227,6 @@ def main():
             camera.close()
         return
 
-    # Normal mode: wait for button presses
     run_live()
 
 
