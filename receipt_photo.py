@@ -124,8 +124,9 @@ def denoise(gray):
 
 
 def flat_area_denoise(gray):
-    """Average patches of flat (non-edge) pixels. Edge pixels pass through untouched.
-    Smaller FLAT_PATCH_SIZE = more precise (less risk of crossing an edge)."""
+    """Patch-safe flat denoiser: averages a pixel only if its entire surrounding
+    patch contains no edges. If any edge falls inside the patch, the center pixel
+    is left untouched. This prevents edge blur regardless of patch size."""
     try:
         import cv2
     except ImportError:
@@ -133,26 +134,25 @@ def flat_area_denoise(gray):
 
     arr = np.asarray(gray, np.float32)
 
-    # Build edge mask: pixels where the Laplacian response is strong are edges.
+    # Detect edges across the whole image.
     lap = cv2.Laplacian(arr.astype(np.uint8), cv2.CV_32F)
-    edge_mask = (np.abs(lap) > FLAT_EDGE_THRESHOLD)
+    edge_map = (np.abs(lap) > FLAT_EDGE_THRESHOLD).astype(np.float32)
 
     r = FLAT_PATCH_SIZE
-    # Box-filter the image and count of non-edge pixels in each patch window.
-    # We treat edge pixels as 0-weight so they don't pollute flat-area averages.
-    flat_vals = np.where(edge_mask, 0.0, arr)
-    flat_count = np.where(edge_mask, 0.0, 1.0)
-
     kernel = np.ones((2 * r + 1, 2 * r + 1), np.float32)
-    sum_vals  = cv2.filter2D(flat_vals,  -1, kernel, borderType=cv2.BORDER_REFLECT)
-    sum_count = cv2.filter2D(flat_count, -1, kernel, borderType=cv2.BORDER_REFLECT)
 
-    # Avoid division by zero in fully-edge patches; fall back to original value.
-    safe_count = np.where(sum_count > 0, sum_count, 1.0)
-    smoothed = np.where(sum_count > 0, sum_vals / safe_count, arr)
+    # Sum of edge pixels within each pixel's patch window.
+    # If this sum is 0, the patch is entirely edge-free.
+    edge_sum = cv2.filter2D(edge_map, -1, kernel, borderType=cv2.BORDER_REFLECT)
+    flat_patch = (edge_sum == 0)
 
-    # Only write back to flat pixels — edges keep their original values.
-    out = np.where(edge_mask, arr, smoothed).clip(0, 255).astype(np.uint8)
+    # Box-average of pixel values within the patch.
+    patch_sum   = cv2.filter2D(arr, -1, kernel, borderType=cv2.BORDER_REFLECT)
+    patch_count = (2 * r + 1) ** 2
+    smoothed    = patch_sum / patch_count
+
+    # Only replace pixels whose entire patch was edge-free.
+    out = np.where(flat_patch, smoothed, arr).clip(0, 255).astype(np.uint8)
     return Image.fromarray(out, "L")
 
 
