@@ -1,0 +1,29 @@
+[Unit]
+Description=Button-triggered receipt photo printer
+# Wait until the system is fully up and USB devices have enumerated
+After=multi-user.target
+
+[Service]
+Type=simple
+
+# --- EDIT THESE THREE LINES to match your username and paths ---
+User=pi
+# Use the venv's python if you made one; otherwise just /usr/bin/python3
+ExecStart=/home/pi/receipt-env/bin/python /home/pi/receipt_photo.py
+WorkingDirectory=/home/pi
+# ---------------------------------------------------------------
+
+# Give USB/camera a moment to be ready before starting (optional but helps)
+ExecStartPre=/bin/sleep 5
+
+# Restart automatically if it crashes
+Restart=on-failure
+RestartSec=3
+
+# Send the script's print() output to the journal so you can debug it
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
