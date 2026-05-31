@@ -84,6 +84,11 @@ LOCAL_CONTRAST_RADIUS = 12
 SHARPEN_PERCENT = 150
 SHARPEN_RADIUS  = 2
 
+DENOISE         = True
+DENOISE_RADIUS  = 3        # bilateral spatial sigma (pixels); 3-7 works well
+DENOISE_SIGMA   = 20       # bilateral intensity sigma; higher = smoother flat areas
+                           # raise to 40 for heavy noise, lower to 10 to preserve micro-detail
+
 DITHER = "atkinson"        # "atkinson" | "floyd" | "threshold"
 
 # ----------------------------------------------------------------------------
@@ -99,6 +104,19 @@ def clahe(gray):
     arr = np.asarray(gray, np.uint8)
     op = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(CLAHE_TILES, CLAHE_TILES))
     return Image.fromarray(op.apply(arr), "L")
+
+
+def denoise(gray):
+    """Bilateral filter: smooths sensor noise while preserving edges.
+    Falls back to a 3x3 median filter if OpenCV is missing."""
+    try:
+        import cv2
+        arr = np.asarray(gray, np.uint8)
+        d = DENOISE_RADIUS * 2 + 1   # kernel diameter (odd)
+        out = cv2.bilateralFilter(arr, d, DENOISE_SIGMA, DENOISE_SIGMA)
+        return Image.fromarray(out, "L")
+    except ImportError:
+        return gray.filter(ImageFilter.MedianFilter(size=3))
 
 
 def pick_gamma(gray):
@@ -127,7 +145,7 @@ def atkinson_dither(gray):
     """Serpentine Atkinson error diffusion."""
     arr = np.asarray(gray, np.float32).copy()
     h, w = arr.shape
-    base = ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2))
+    base = ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)) 
     for y in range(h):
         ltr = (y % 2 == 0)
         xs = range(w) if ltr else range(w - 1, -1, -1)
@@ -155,6 +173,9 @@ def prepare_image(img):
     w, h = img.size
     new_h = max(1, round(h * (PRINT_WIDTH / w)))
     img = img.resize((PRINT_WIDTH, new_h), Image.LANCZOS)
+
+    if DENOISE:
+        img = denoise(img)
 
     img = clahe(img)
 
