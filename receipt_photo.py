@@ -87,6 +87,13 @@ SHARPEN_RADIUS  = 2
 DENOISE_RADIUS  = 2        # bilateral spatial sigma; keep small (1-3) for light touch
 DENOISE_SIGMA   = 10       # bilateral intensity sigma; keep low (8-15) to preserve edges
 
+FLAT_DENOISE         = True
+FLAT_PATCH_SIZE      = 5   # patch radius in pixels; smaller = more precise, less smoothing
+                           # try 3 (precise) to 7 (smoother flat surfaces)
+FLAT_EDGE_THRESHOLD  = 12  # Laplacian threshold to classify a pixel as an edge (0-255)
+                           # lower = more pixels treated as edges (more detail preserved)
+                           # higher = fewer edges detected (more area gets smoothed)
+
 DITHER = "atkinson"        # "atkinson" | "floyd" | "threshold"
 
 # ----------------------------------------------------------------------------
@@ -114,6 +121,39 @@ def denoise(gray):
         return Image.fromarray(out, "L")
     except ImportError:
         return gray.filter(ImageFilter.MedianFilter(size=3))
+
+
+def flat_area_denoise(gray):
+    """Average patches of flat (non-edge) pixels. Edge pixels pass through untouched.
+    Smaller FLAT_PATCH_SIZE = more precise (less risk of crossing an edge)."""
+    try:
+        import cv2
+    except ImportError:
+        return gray
+
+    arr = np.asarray(gray, np.float32)
+
+    # Build edge mask: pixels where the Laplacian response is strong are edges.
+    lap = cv2.Laplacian(arr.astype(np.uint8), cv2.CV_32F)
+    edge_mask = (np.abs(lap) > FLAT_EDGE_THRESHOLD)
+
+    r = FLAT_PATCH_SIZE
+    # Box-filter the image and count of non-edge pixels in each patch window.
+    # We treat edge pixels as 0-weight so they don't pollute flat-area averages.
+    flat_vals = np.where(edge_mask, 0.0, arr)
+    flat_count = np.where(edge_mask, 0.0, 1.0)
+
+    kernel = np.ones((2 * r + 1, 2 * r + 1), np.float32)
+    sum_vals  = cv2.filter2D(flat_vals,  -1, kernel, borderType=cv2.BORDER_REFLECT)
+    sum_count = cv2.filter2D(flat_count, -1, kernel, borderType=cv2.BORDER_REFLECT)
+
+    # Avoid division by zero in fully-edge patches; fall back to original value.
+    safe_count = np.where(sum_count > 0, sum_count, 1.0)
+    smoothed = np.where(sum_count > 0, sum_vals / safe_count, arr)
+
+    # Only write back to flat pixels — edges keep their original values.
+    out = np.where(edge_mask, arr, smoothed).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(out, "L")
 
 
 def pick_gamma(gray):
@@ -174,6 +214,8 @@ def prepare_image(img):
     img = denoise(img)
     img = clahe(img)
     img = denoise(img)
+    if FLAT_DENOISE:
+        img = flat_area_denoise(img)
 
     gamma = pick_gamma(img) if AUTO_GAMMA else GAMMA
     if gamma and gamma != 1.0:
