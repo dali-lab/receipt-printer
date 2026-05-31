@@ -7,8 +7,8 @@ the photo is tone-mapped and dithered for a 1-bit thermal head ->
 printed on an Epson TM-T88V (USB).
 
 Quality pipeline:
-  grayscale -> resize -> denoise -> CLAHE -> denoise -> (auto)gamma ->
-  local contrast -> unsharp -> serpentine Atkinson dither.
+  grayscale -> resize -> CLAHE (adaptive local equalization) ->
+  (auto)gamma tone map -> clarity -> unsharp edges -> serpentine Atkinson dither.
 
 Flash:
   MAX7219 8x8 LED matrix over SPI. Lights before capture, gives the camera
@@ -56,12 +56,6 @@ BUTTON_PULLUP = False
 ROTATE_DEGREES = 0
 CAMERA_SETTLE  = 1.5       # seconds to settle when the camera first starts
 
-# Exposure lock: forces a fixed shutter speed to prevent motion blur.
-# None = let the camera auto-expose (original behaviour).
-# Set to e.g. 4000 (1/250s) for fast freeze, 8000 (1/125s) for moderate.
-# Lower value = faster shutter = less blur but more noise if light is dim.
-EXPOSURE_TIME_US = 6000    # microseconds; ~1/167s — good balance with the LED flash
-
 # ----------------------------------------------------------------------------
 # FLASH CONFIG (MAX7219 8x8 LED matrix over SPI)
 # ----------------------------------------------------------------------------
@@ -76,8 +70,8 @@ FLASH_SETTLE    = 0.4      # seconds the light is on before capture, so
 # ----------------------------------------------------------------------------
 # IMAGE QUALITY KNOBS
 # ----------------------------------------------------------------------------
-CLAHE_CLIP  = 1.2          # keep low (1.0-2.0); higher clips amplify noise in flat areas
-CLAHE_TILES = 16           # more tiles = smaller regions = less per-region amplification
+CLAHE_CLIP  = 2.0          # local contrast strength (2-4); too high = noisy
+CLAHE_TILES = 8
 CONTRAST_CUTOFF = 2        # fallback only, if OpenCV missing
 
 AUTO_GAMMA   = True
@@ -90,10 +84,8 @@ LOCAL_CONTRAST_RADIUS = 12
 SHARPEN_PERCENT = 150
 SHARPEN_RADIUS  = 2
 
-DENOISE         = True
-DENOISE_RADIUS  = 3        # bilateral spatial sigma (pixels); 3-7 works well
-DENOISE_SIGMA   = 20       # bilateral intensity sigma; higher = smoother flat areas
-                           # raise to 40 for heavy noise, lower to 10 to preserve micro-detail
+DENOISE_RADIUS  = 2        # bilateral spatial sigma; keep small (1-3) for light touch
+DENOISE_SIGMA   = 10       # bilateral intensity sigma; keep low (8-15) to preserve edges
 
 DITHER = "atkinson"        # "atkinson" | "floyd" | "threshold"
 
@@ -113,12 +105,11 @@ def clahe(gray):
 
 
 def denoise(gray):
-    """Bilateral filter: smooths sensor noise while preserving edges.
-    Falls back to a 3x3 median filter if OpenCV is missing."""
+    """Light bilateral filter pass. Falls back to median if OpenCV is missing."""
     try:
         import cv2
         arr = np.asarray(gray, np.uint8)
-        d = DENOISE_RADIUS * 2 + 1   # kernel diameter (odd)
+        d = DENOISE_RADIUS * 2 + 1
         out = cv2.bilateralFilter(arr, d, DENOISE_SIGMA, DENOISE_SIGMA)
         return Image.fromarray(out, "L")
     except ImportError:
@@ -151,7 +142,7 @@ def atkinson_dither(gray):
     """Serpentine Atkinson error diffusion."""
     arr = np.asarray(gray, np.float32).copy()
     h, w = arr.shape
-    base = ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)) 
+    base = ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2))
     for y in range(h):
         ltr = (y % 2 == 0)
         xs = range(w) if ltr else range(w - 1, -1, -1)
@@ -180,14 +171,9 @@ def prepare_image(img):
     new_h = max(1, round(h * (PRINT_WIDTH / w)))
     img = img.resize((PRINT_WIDTH, new_h), Image.LANCZOS)
 
-    if DENOISE:
-        img = denoise(img)
-
+    img = denoise(img)
     img = clahe(img)
-
-    # Second lighter pass to catch noise that CLAHE re-amplifies in flat regions.
-    if DENOISE:
-        img = denoise(img)
+    img = denoise(img)
 
     gamma = pick_gamma(img) if AUTO_GAMMA else GAMMA
     if gamma and gamma != 1.0:
@@ -288,11 +274,6 @@ class Camera:
         from picamera2 import Picamera2
         self.cam = Picamera2()
         self.cam.configure(self.cam.create_still_configuration())
-        if EXPOSURE_TIME_US is not None:
-            self.cam.set_controls({
-                "ExposureTime": EXPOSURE_TIME_US,
-                "AeEnable": False,       # disable auto-exposure so our value sticks
-            })
         self.cam.start()
         time.sleep(CAMERA_SETTLE)
 
