@@ -84,6 +84,16 @@ LOCAL_CONTRAST_RADIUS = 12
 SHARPEN_PERCENT = 150
 SHARPEN_RADIUS  = 2
 
+DENOISE_RADIUS  = 2        # bilateral spatial sigma; keep small (1-3) for light touch
+DENOISE_SIGMA   = 10       # bilateral intensity sigma; keep low (8-15) to preserve edges
+
+FLAT_DENOISE         = True
+FLAT_PATCH_SIZE      = 5   # patch radius in pixels; smaller = more precise, less smoothing
+                           # try 3 (precise) to 7 (smoother flat surfaces)
+FLAT_EDGE_THRESHOLD  = 12  # Laplacian threshold to classify a pixel as an edge (0-255)
+                           # lower = more pixels treated as edges (more detail preserved)
+                           # higher = fewer edges detected (more area gets smoothed)
+
 DITHER = "atkinson"        # "atkinson" | "floyd" | "threshold"
 
 # ----------------------------------------------------------------------------
@@ -99,6 +109,56 @@ def clahe(gray):
     arr = np.asarray(gray, np.uint8)
     op = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(CLAHE_TILES, CLAHE_TILES))
     return Image.fromarray(op.apply(arr), "L")
+
+
+def denoise(gray):
+    """Light bilateral filter pass. Falls back to median if OpenCV is missing."""
+    try:
+        import cv2
+        arr = np.asarray(gray, np.uint8)
+        d = DENOISE_RADIUS * 2 + 1
+        out = cv2.bilateralFilter(arr, d, DENOISE_SIGMA, DENOISE_SIGMA)
+        return Image.fromarray(out, "L")
+    except ImportError:
+        return gray.filter(ImageFilter.MedianFilter(size=3))
+
+
+def flat_area_denoise(gray):
+    """Patch-safe flat denoiser: averages a pixel only if its entire surrounding
+    patch contains no edges. If any edge falls inside the patch, the center pixel
+    is left untouched. This prevents edge blur regardless of patch size."""
+    try:
+        import cv2
+    except ImportError:
+        return gray
+
+    arr = np.asarray(gray, np.float32)
+
+    # Detect edges across the whole image.
+    lap = cv2.Laplacian(arr.astype(np.uint8), cv2.CV_32F)
+    edge_map = (np.abs(lap) > FLAT_EDGE_THRESHOLD).astype(np.float32)
+
+    r = FLAT_PATCH_SIZE
+    kernel = np.ones((2 * r + 1, 2 * r + 1), np.float32)
+
+    # Sum of edge pixels within each pixel's patch window.
+    # If this sum is 0, the patch is entirely edge-free.
+    edge_sum = cv2.filter2D(edge_map, -1, kernel, borderType=cv2.BORDER_REFLECT)
+    flat_patch = (edge_sum == 0)
+
+    # Box-average of pixel values within the patch.
+    patch_sum   = cv2.filter2D(arr, -1, kernel, borderType=cv2.BORDER_REFLECT)
+    patch_count = (2 * r + 1) ** 2
+    smoothed    = patch_sum / patch_count
+
+    # Only replace pixels whose entire patch was edge-free.
+    flat_count = int(flat_patch.sum())
+    total = arr.size
+    print(f"flat_area_denoise: {flat_count}/{total} pixels smoothed ({100*flat_count/total:.1f}%) "
+          f"patch={2*r+1}x{2*r+1} edge_threshold={FLAT_EDGE_THRESHOLD}")
+
+    out = np.where(flat_patch, smoothed, arr).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(out, "L")
 
 
 def pick_gamma(gray):
@@ -156,7 +216,11 @@ def prepare_image(img):
     new_h = max(1, round(h * (PRINT_WIDTH / w)))
     img = img.resize((PRINT_WIDTH, new_h), Image.LANCZOS)
 
+    img = denoise(img)
     img = clahe(img)
+    img = denoise(img)
+    if FLAT_DENOISE:
+        img = flat_area_denoise(img)
 
     gamma = pick_gamma(img) if AUTO_GAMMA else GAMMA
     if gamma and gamma != 1.0:
