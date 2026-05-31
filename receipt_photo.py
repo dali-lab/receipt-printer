@@ -7,8 +7,8 @@ the photo is tone-mapped and dithered for a 1-bit thermal head ->
 printed on an Epson TM-T88V (USB).
 
 Quality pipeline:
-  grayscale -> resize -> CLAHE (adaptive local equalization) ->
-  (auto)gamma tone map -> clarity -> unsharp edges -> serpentine Atkinson dither.
+  grayscale -> resize -> denoise -> CLAHE -> denoise -> (auto)gamma ->
+  local contrast -> unsharp -> serpentine Atkinson dither.
 
 Flash:
   MAX7219 8x8 LED matrix over SPI. Lights before capture, gives the camera
@@ -56,6 +56,12 @@ BUTTON_PULLUP = False
 ROTATE_DEGREES = 0
 CAMERA_SETTLE  = 1.5       # seconds to settle when the camera first starts
 
+# Exposure lock: forces a fixed shutter speed to prevent motion blur.
+# None = let the camera auto-expose (original behaviour).
+# Set to e.g. 4000 (1/250s) for fast freeze, 8000 (1/125s) for moderate.
+# Lower value = faster shutter = less blur but more noise if light is dim.
+EXPOSURE_TIME_US = 6000    # microseconds; ~1/167s — good balance with the LED flash
+
 # ----------------------------------------------------------------------------
 # FLASH CONFIG (MAX7219 8x8 LED matrix over SPI)
 # ----------------------------------------------------------------------------
@@ -70,8 +76,8 @@ FLASH_SETTLE    = 0.4      # seconds the light is on before capture, so
 # ----------------------------------------------------------------------------
 # IMAGE QUALITY KNOBS
 # ----------------------------------------------------------------------------
-CLAHE_CLIP  = 2.0          # local contrast strength (2-4); too high = noisy
-CLAHE_TILES = 8
+CLAHE_CLIP  = 1.2          # keep low (1.0-2.0); higher clips amplify noise in flat areas
+CLAHE_TILES = 16           # more tiles = smaller regions = less per-region amplification
 CONTRAST_CUTOFF = 2        # fallback only, if OpenCV missing
 
 AUTO_GAMMA   = True
@@ -179,6 +185,10 @@ def prepare_image(img):
 
     img = clahe(img)
 
+    # Second lighter pass to catch noise that CLAHE re-amplifies in flat regions.
+    if DENOISE:
+        img = denoise(img)
+
     gamma = pick_gamma(img) if AUTO_GAMMA else GAMMA
     if gamma and gamma != 1.0:
         img = apply_gamma(img, gamma)
@@ -278,6 +288,11 @@ class Camera:
         from picamera2 import Picamera2
         self.cam = Picamera2()
         self.cam.configure(self.cam.create_still_configuration())
+        if EXPOSURE_TIME_US is not None:
+            self.cam.set_controls({
+                "ExposureTime": EXPOSURE_TIME_US,
+                "AeEnable": False,       # disable auto-exposure so our value sticks
+            })
         self.cam.start()
         time.sleep(CAMERA_SETTLE)
 
