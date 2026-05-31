@@ -152,6 +152,11 @@ def flat_area_denoise(gray):
     smoothed    = patch_sum / patch_count
 
     # Only replace pixels whose entire patch was edge-free.
+    flat_count = int(flat_patch.sum())
+    total = arr.size
+    print(f"flat_area_denoise: {flat_count}/{total} pixels smoothed ({100*flat_count/total:.1f}%) "
+          f"patch={2*r+1}x{2*r+1} edge_threshold={FLAT_EDGE_THRESHOLD}")
+
     out = np.where(flat_patch, smoothed, arr).clip(0, 255).astype(np.uint8)
     return Image.fromarray(out, "L")
 
