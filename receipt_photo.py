@@ -52,7 +52,7 @@ IMAGE_IMPL       = "bitImageRaster"
 # BUTTON / CAMERA CONFIG
 # ----------------------------------------------------------------------------
 BUTTON_GPIO   = 17
-BUTTON_PULLUP = False
+BUTTON_PULLUP = True       # internal pull-up; wire button between GPIO17 and GND
 ROTATE_DEGREES = 0
 CAMERA_SETTLE  = 1.5       # seconds to settle when the camera first starts
 
@@ -288,6 +288,65 @@ class Flash:
 
 
 # ----------------------------------------------------------------------------
+# CAPTION
+# ----------------------------------------------------------------------------
+
+CAPTION_TEXT    = "Technigala 26S"
+CAPTION_FONT_SIZE = 24          # px; Press Start 2P is 8-px grid so multiples of 8 look sharpest
+CAPTION_PADDING = 18            # px of white space above and below the text row
+CAPTION_FONT_URL = (
+    "https://github.com/google/fonts/raw/main/ofl/pressstart2p/PressStart2P-Regular.ttf"
+)
+
+_caption_font = None
+
+def _load_pixel_font():
+    """Return an ImageFont for the caption. Downloads Press Start 2P once to /tmp."""
+    global _caption_font
+    if _caption_font is not None:
+        return _caption_font
+
+    from PIL import ImageFont
+    import os, urllib.request
+
+    cache = "/tmp/PressStart2P-Regular.ttf"
+    if not os.path.exists(cache):
+        print("Downloading pixel font...")
+        urllib.request.urlretrieve(CAPTION_FONT_URL, cache)
+
+    try:
+        _caption_font = ImageFont.truetype(cache, CAPTION_FONT_SIZE)
+    except Exception as e:
+        print(f"Could not load pixel font ({e}); falling back to default.")
+        _caption_font = ImageFont.load_default()
+    return _caption_font
+
+
+def make_caption_strip(width):
+    """Return a 1-bit PIL image of CAPTION_TEXT centred at the given width."""
+    from PIL import ImageDraw
+    font = _load_pixel_font()
+
+    # Measure text
+    probe = Image.new("L", (1, 1))
+    draw  = ImageDraw.Draw(probe)
+    bbox  = draw.textbbox((0, 0), CAPTION_TEXT, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    strip_h = int(th + CAPTION_PADDING * 2)
+    strip   = Image.new("L", (width, strip_h), 255)   # white background
+    draw    = ImageDraw.Draw(strip)
+    x = (width - tw) // 2
+    y = CAPTION_PADDING
+    draw.text((x, y), CAPTION_TEXT, font=font, fill=0)
+
+    # Threshold to hard 1-bit so it matches the dithered photo
+    arr = np.asarray(strip, np.uint8)
+    arr = np.where(arr < 128, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, "L").convert("1")
+
+
+# ----------------------------------------------------------------------------
 # PRINTER
 # ----------------------------------------------------------------------------
 
@@ -298,9 +357,16 @@ def get_printer():
 
 
 def print_image(img):
+    caption = make_caption_strip(img.width)
+
+    # Stack photo above caption
+    combined = Image.new("1", (img.width, img.height + caption.height), 1)
+    combined.paste(img,     (0, 0))
+    combined.paste(caption, (0, img.height))
+
     printer = get_printer()
     try:
-        printer.image(img, impl=IMAGE_IMPL)
+        printer.image(combined, impl=IMAGE_IMPL)
         if FEED_LINES_AFTER:
             printer.print_and_feed(FEED_LINES_AFTER)
         if CUT_PAPER:
@@ -369,7 +435,7 @@ def run_live():
 
     camera = Camera()
     flash = Flash()
-    button = Button(BUTTON_GPIO, pull_up=BUTTON_PULLUP)
+    button = Button(BUTTON_GPIO, pull_up=BUTTON_PULLUP, bounce_time=0.05)
     button.when_pressed = lambda: handle_press(camera, flash)
 
     print(f"Ready. Press the button on GPIO{BUTTON_GPIO} to take + print a photo.")
