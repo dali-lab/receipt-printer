@@ -30,15 +30,19 @@ Usage:
   Print an existing image (no camera):  python3 receipt_photo.py path/to/img.jpg
 
 Wiring (Adeept RGB LED module -> Pi):
-  +  -> 5V    (pin 2)    -- common anode; 5V is required because green/blue
-                            LEDs have ~3 V forward voltage and won't light
-                            with 3.3 V supply
+  +  -> 3.3V  (pin 1)    -- common anode. 3.3V (not 5V) so the "off" state
+                            (GPIO HIGH = 3.3V on cathode) gives 0V across
+                            the LED -> no idle glow. With 5V here, red's
+                            low forward voltage leaks current and the LED
+                            idles dim red.
   R  -> GPIO22 (pin 15)
   G  -> GPIO23 (pin 16)
   B  -> GPIO24 (pin 18)
 
-  Off state: GPIO HIGH = 3.3 V on cathode, 5 V on anode -> 1.7 V across the
-  LED, below all three forward voltages, so no leakage glow.
+  Tradeoff vs. 5V supply: peak brightness is lower and color skews warm
+  (red has the lowest Vf so it gets the most current at 3.3V). Acceptable
+  for a tiny indicator flash; for real illumination, switch to a MAX7219
+  white matrix.
 """
 
 import sys
@@ -77,6 +81,18 @@ FLASH_GREEN_GPIO = 23      # BCM numbering; physical pin 16
 FLASH_BLUE_GPIO  = 24      # BCM numbering; physical pin 18
 FLASH_SETTLE     = 0.4     # seconds the light is on before capture, so
                            # auto-exposure adapts to the lit scene
+
+# Countdown sequence played before each capture. Each tuple is
+# (red, green, blue, on_seconds, off_seconds). Default: red -> yellow ->
+# green -> three rapid white blinks -> solid white for capture.
+COUNTDOWN_STEPS = (
+    (1, 0, 0, 0.25, 0.75),   # 3 ... red
+    (1, 1, 0, 0.25, 0.75),   # 2 ... yellow
+    (0, 1, 0, 0.25, 0.75),   # 1 ... green
+    (1, 1, 1, 0.08, 0.08),   # go!
+    (1, 1, 1, 0.08, 0.08),
+    (1, 1, 1, 0.08, 0.08),
+)
 
 # ----------------------------------------------------------------------------
 # IMAGE QUALITY KNOBS
@@ -280,19 +296,30 @@ class Flash:
             print(f"Flash disabled (gpiozero not available): {e}")
             self.pins = ()
 
-    def on(self):
-        for pin in self.pins:
+    def _set(self, r, g, b):
+        if not self.pins:
+            return
+        for pin, val in zip(self.pins, (r, g, b)):
             try:
-                pin.on()
+                pin.on() if val else pin.off()
             except Exception:
                 pass
 
+    def on(self):
+        self._set(1, 1, 1)
+
     def off(self):
-        for pin in self.pins:
-            try:
-                pin.off()
-            except Exception:
-                pass
+        self._set(0, 0, 0)
+
+    def countdown(self):
+        """Play COUNTDOWN_STEPS as a visual cue, then leave the LED off."""
+        if not self.pins:
+            return
+        for r, g, b, on_s, off_s in COUNTDOWN_STEPS:
+            self._set(r, g, b)
+            time.sleep(on_s)
+            self.off()
+            time.sleep(off_s)
 
     def close(self):
         self.off()
@@ -428,6 +455,8 @@ def handle_press(camera, flash):
         print("Still printing the last one -- ignoring press.")
         return
     try:
+        print("Countdown...")
+        flash.countdown()
         print("Flash on, capturing...")
         flash.on()
         time.sleep(FLASH_SETTLE)        # let auto-exposure adapt to the light
