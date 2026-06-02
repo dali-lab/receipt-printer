@@ -82,16 +82,24 @@ FLASH_BLUE_GPIO  = 24      # BCM numbering; physical pin 18
 FLASH_SETTLE     = 0.4     # seconds the light is on before capture, so
                            # auto-exposure adapts to the lit scene
 
+# Module polarity. Adeept RGB LED modules ship in both flavors regardless of
+# the "+" silkscreen label.
+#   True  = common anode  -> wire "+" to 3.3V (pin 1); R/G/B sink current
+#   False = common cathode -> wire "+" to GND  (pin 6); R/G/B source current
+# If the LED idles lit (e.g. red glow) or the countdown colors look inverted
+# (white during "off", dark during "on"), flip this and rewire "+".
+FLASH_COMMON_ANODE = True
+
 # Countdown sequence played before each capture. Each tuple is
 # (red, green, blue, on_seconds, off_seconds). Default: red -> yellow ->
 # green -> three rapid white blinks -> solid white for capture.
 COUNTDOWN_STEPS = (
-    (1, 0, 0, 0.25, 0.75),   # 3 ... red
-    (1, 1, 0, 0.25, 0.75),   # 2 ... yellow
-    (0, 1, 0, 0.25, 0.75),   # 1 ... green
-    (1, 1, 1, 0.08, 0.08),   # go!
-    (1, 1, 1, 0.08, 0.08),
-    (1, 1, 1, 0.08, 0.08),
+    (1, 0, 0, 0.25, 0.25),   # 3 ... red
+    (1, 1, 0, 0.25, 0.25),   # 2 ... yellow
+    (0, 1, 0, 0.25, 0.25),   # 1 ... green
+    (1, 1, 1, 0.06, 0.06),   # go!
+    (1, 1, 1, 0.06, 0.06),
+    (1, 1, 1, 0.06, 0.06),
 )
 
 # ----------------------------------------------------------------------------
@@ -287,10 +295,11 @@ class Flash:
             return
         try:
             from gpiozero import LED
+            active_high = not FLASH_COMMON_ANODE
             self.pins = (
-                LED(FLASH_RED_GPIO,   active_high=False, initial_value=False),
-                LED(FLASH_GREEN_GPIO, active_high=False, initial_value=False),
-                LED(FLASH_BLUE_GPIO,  active_high=False, initial_value=False),
+                LED(FLASH_RED_GPIO,   active_high=active_high, initial_value=False),
+                LED(FLASH_GREEN_GPIO, active_high=active_high, initial_value=False),
+                LED(FLASH_BLUE_GPIO,  active_high=active_high, initial_value=False),
             )
         except Exception as e:
             print(f"Flash disabled (gpiozero not available): {e}")
@@ -498,6 +507,25 @@ def run_live():
 
 def main():
     args = sys.argv[1:]
+
+    if args and args[0] == "--flash-test":
+        flash = Flash()
+        try:
+            for label, color in [
+                ("RED",   (1, 0, 0)),
+                ("GREEN", (0, 1, 0)),
+                ("BLUE",  (0, 0, 1)),
+                ("WHITE", (1, 1, 1)),
+            ]:
+                print(f"{label} (should match label)")
+                flash._set(*color)
+                time.sleep(1.5)
+            flash.off()
+            print("OFF (should be fully dark for 3s)")
+            time.sleep(3)
+        finally:
+            flash.close()
+        return
 
     if args and args[0] != "--test":
         # Print an existing image file (no camera, no flash)
