@@ -11,22 +11,28 @@ Quality pipeline:
   (auto)gamma tone map -> clarity -> unsharp edges -> serpentine Atkinson dither.
 
 Flash:
-  MAX7219 8x8 LED matrix over SPI. Lights before capture, gives the camera
-  a beat to adjust exposure, then turns off (flash sync). Degrades gracefully
-  to no-flash if the matrix isn't connected / libraries aren't installed.
+  Adeept 8x8 LED matrix driven by two cascaded 74HC595 shift registers over
+  hardware SPI. Brute-forces all 64 LEDs on by shifting all-enabled bytes to
+  both chips, then off after capture. WARNING: this exceeds the 74HC595's
+  70 mA package current rating by ~50%, so keep bursts short and infrequent
+  -- it will shorten chip lifespan. Degrades gracefully to no-flash if SPI /
+  spidev isn't available.
 
 Setup (one time):
   sudo raspi-config nonint do_spi 0 && sudo reboot
-  uv pip install luma.led_matrix spidev rpi-lgpio
+  uv pip install spidev rpi-lgpio
 
 Usage:
   Live (waits for button):              python3 receipt_photo.py
   Test one capture+print immediately:   python3 receipt_photo.py --test
   Print an existing image (no camera):  python3 receipt_photo.py path/to/img.jpg
 
-Wiring (MAX7219 matrix -> Pi, hardware SPI):
-  VCC->5V(pin 2)  GND->GND(pin 6)  DIN->GPIO10/MOSI(pin 19)
-  CS->GPIO8/CE0(pin 24)  CLK->GPIO11/SCLK(pin 23)
+Wiring (Adeept 74HC595 matrix -> Pi, hardware SPI):
+  +   -> 5V       (pin 2)
+  -   -> GND      (pin 6)
+  DS  -> GPIO10/MOSI  (pin 19)
+  SH_CP -> GPIO11/SCLK (pin 23)
+  ST_CP -> GPIO8/CE0   (pin 24)   -- spidev's CS rising edge latches the 595s
 """
 
 import sys
@@ -57,15 +63,23 @@ ROTATE_DEGREES = 0
 CAMERA_SETTLE  = 1.5       # seconds to settle when the camera first starts
 
 # ----------------------------------------------------------------------------
-# FLASH CONFIG (MAX7219 8x8 LED matrix over SPI)
+# FLASH CONFIG (Adeept 8x8 LED matrix, two cascaded 74HC595s over SPI)
 # ----------------------------------------------------------------------------
 FLASH_ENABLED   = True
 FLASH_SPI_PORT  = 0        # /dev/spidev0.0  -> port 0, device 0
 FLASH_SPI_DEV   = 0
-FLASH_CASCADED  = 1        # number of chained 8x8 panels
-FLASH_BRIGHTNESS = 255     # 0-255 (contrast)
+FLASH_SPI_HZ    = 1_000_000
 FLASH_SETTLE    = 0.4      # seconds the light is on before capture, so
-                           # auto-exposure adapts to the lit scene
+                           # auto-exposure adapts to the lit scene.
+                           # Total on-time per shot is ~0.5-1s; keep this low.
+
+# Brute-force "all on" bytes for the two cascaded 595s. spidev shifts MSB
+# first; the first byte ends up in the second chip in the chain (data ripples
+# through). Common Adeept layout: rows active-low (0x00 enables all rows),
+# columns active-high (0xFF lights all columns). If pressing the button
+# lights only a single row or column, swap the byte order below.
+FLASH_ON_BYTES  = (0x00, 0xFF)
+FLASH_OFF_BYTES = (0xFF, 0xFF)   # rows disabled -> no LED has a current path
 
 # ----------------------------------------------------------------------------
 # IMAGE QUALITY KNOBS
@@ -243,48 +257,58 @@ def prepare_image(img):
 
 
 # ----------------------------------------------------------------------------
-# FLASH (MAX7219 LED matrix)
+# FLASH (Adeept 8x8 matrix, two cascaded 74HC595s)
 # ----------------------------------------------------------------------------
 
 class Flash:
-    """LED-matrix flash. If anything is missing/unconnected, on()/off() become
-    no-ops so the rest of the program keeps working."""
+    """Brute-force all-on flash for an Adeept 74HC595 8x8 matrix. Shifts two
+    bytes out via SPI; spidev's CS line (CE0) acts as the 595 latch (ST_CP)
+    on its rising edge after each transfer. Degrades to no-op if spidev isn't
+    available so the rest of the program keeps working.
+
+    Static all-on runs the row chip's total package current ~50% over the
+    74HC595's 70 mA rating. Safe for short bursts during testing; not safe
+    for prolonged or continuous use."""
 
     def __init__(self):
-        self.device = None
+        self.spi = None
         if not FLASH_ENABLED:
             return
         try:
-            from luma.led_matrix.device import max7219
-            from luma.core.interface.serial import spi, noop
-            serial = spi(port=FLASH_SPI_PORT, device=FLASH_SPI_DEV, gpio=noop())
-            self.device = max7219(serial, cascaded=FLASH_CASCADED)
-            self.device.contrast(FLASH_BRIGHTNESS)
-            self.device.clear()
+            import spidev
+            self.spi = spidev.SpiDev()
+            self.spi.open(FLASH_SPI_PORT, FLASH_SPI_DEV)
+            self.spi.max_speed_hz = FLASH_SPI_HZ
+            self.spi.mode = 0
+            self.off()
         except Exception as e:
-            print(f"Flash disabled (matrix not available): {e}")
-            self.device = None
+            print(f"Flash disabled (SPI not available): {e}")
+            self.spi = None
+
+    def _send(self, bytes_pair):
+        try:
+            self.spi.xfer2([bytes_pair[0], bytes_pair[1]])
+        except Exception:
+            pass
 
     def on(self):
-        if self.device is None:
+        if self.spi is None:
             return
-        try:
-            from luma.core.render import canvas
-            with canvas(self.device) as draw:
-                draw.rectangle(self.device.bounding_box, fill="white")
-        except Exception:
-            pass
+        self._send(FLASH_ON_BYTES)
 
     def off(self):
-        if self.device is None:
+        if self.spi is None:
             return
-        try:
-            self.device.clear()
-        except Exception:
-            pass
+        self._send(FLASH_OFF_BYTES)
 
     def close(self):
         self.off()
+        if self.spi is not None:
+            try:
+                self.spi.close()
+            except Exception:
+                pass
+        self.spi = None
 
 
 # ----------------------------------------------------------------------------
