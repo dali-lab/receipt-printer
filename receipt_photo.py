@@ -90,7 +90,7 @@ DENOISE_SIGMA   = 10       # bilateral intensity sigma; keep low (8-15) to prese
 FLAT_DENOISE         = True
 FLAT_PATCH_SIZE      = 5   # patch radius in pixels; smaller = more precise, less smoothing
                            # try 3 (precise) to 7 (smoother flat surfaces)
-FLAT_EDGE_THRESHOLD  = 12  # Laplacian threshold to classify a pixel as an edge (0-255)
+FLAT_EDGE_THRESHOLD  = 30  # Laplacian threshold to classify a pixel as an edge (0-255)
                            # lower = more pixels treated as edges (more detail preserved)
                            # higher = fewer edges detected (more area gets smoothed)
 

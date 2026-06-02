@@ -7,10 +7,10 @@ After=multi-user.target
 Type=simple
 
 # --- EDIT THESE THREE LINES to match your username and paths ---
-User=pi
+User=dali
 # Use the venv's python if you made one; otherwise just /usr/bin/python3
-ExecStart=/home/pi/receipt-env/bin/python /home/pi/receipt_photo.py
-WorkingDirectory=/home/pi
+ExecStart=/home/dali/Desktop/receipt-printer/.venv/bin/python /home/dali/Desktop/receipt-printer/receipt_photo.py
+WorkingDirectory=/home/dali
 # ---------------------------------------------------------------
 
 # Give USB/camera a moment to be ready before starting (optional but helps)
