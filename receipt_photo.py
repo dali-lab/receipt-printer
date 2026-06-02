@@ -11,28 +11,34 @@ Quality pipeline:
   (auto)gamma tone map -> clarity -> unsharp edges -> serpentine Atkinson dither.
 
 Flash:
-  Adeept 8x8 LED matrix driven by two cascaded 74HC595 shift registers over
-  hardware SPI. Brute-forces all 64 LEDs on by shifting all-enabled bytes to
-  both chips, then off after capture. WARNING: this exceeds the 74HC595's
-  70 mA package current rating by ~50%, so keep bursts short and infrequent
-  -- it will shorten chip lifespan. Degrades gracefully to no-flash if SPI /
-  spidev isn't available.
+  Adeept common-anode RGB LED module (pins: + R G B). All three cathodes are
+  pulled LOW simultaneously to mix to white, then HIGH to turn off. Built-in
+  series resistors keep current safe (~14 mA per color, ~40 mA total when
+  white) -- no current-budget concerns. Degrades gracefully to no-flash if
+  gpiozero isn't available.
+
+  NOTE: this is a single 5mm RGB LED, not a matrix. It is much dimmer than a
+  real flash and contributes little to photo exposure -- but the light is
+  white (correct color temperature) rather than red.
 
 Setup (one time):
-  sudo raspi-config nonint do_spi 0 && sudo reboot
-  uv pip install spidev rpi-lgpio
+  uv pip install rpi-lgpio
 
 Usage:
   Live (waits for button):              python3 receipt_photo.py
   Test one capture+print immediately:   python3 receipt_photo.py --test
   Print an existing image (no camera):  python3 receipt_photo.py path/to/img.jpg
 
-Wiring (Adeept 74HC595 matrix -> Pi, hardware SPI):
-  +   -> 5V       (pin 2)
-  -   -> GND      (pin 6)
-  DS  -> GPIO10/MOSI  (pin 19)
-  SH_CP -> GPIO11/SCLK (pin 23)
-  ST_CP -> GPIO8/CE0   (pin 24)   -- spidev's CS rising edge latches the 595s
+Wiring (Adeept RGB LED module -> Pi):
+  +  -> 5V    (pin 2)    -- common anode; 5V is required because green/blue
+                            LEDs have ~3 V forward voltage and won't light
+                            with 3.3 V supply
+  R  -> GPIO22 (pin 15)
+  G  -> GPIO23 (pin 16)
+  B  -> GPIO24 (pin 18)
+
+  Off state: GPIO HIGH = 3.3 V on cathode, 5 V on anode -> 1.7 V across the
+  LED, below all three forward voltages, so no leakage glow.
 """
 
 import sys
@@ -63,23 +69,14 @@ ROTATE_DEGREES = 0
 CAMERA_SETTLE  = 1.5       # seconds to settle when the camera first starts
 
 # ----------------------------------------------------------------------------
-# FLASH CONFIG (Adeept 8x8 LED matrix, two cascaded 74HC595s over SPI)
+# FLASH CONFIG (Adeept common-anode RGB LED module)
 # ----------------------------------------------------------------------------
-FLASH_ENABLED   = True
-FLASH_SPI_PORT  = 0        # /dev/spidev0.0  -> port 0, device 0
-FLASH_SPI_DEV   = 0
-FLASH_SPI_HZ    = 1_000_000
-FLASH_SETTLE    = 0.4      # seconds the light is on before capture, so
-                           # auto-exposure adapts to the lit scene.
-                           # Total on-time per shot is ~0.5-1s; keep this low.
-
-# Brute-force "all on" bytes for the two cascaded 595s. spidev shifts MSB
-# first; the first byte ends up in the second chip in the chain (data ripples
-# through). Common Adeept layout: rows active-low (0x00 enables all rows),
-# columns active-high (0xFF lights all columns). If pressing the button
-# lights only a single row or column, swap the byte order below.
-FLASH_ON_BYTES  = (0x00, 0xFF)
-FLASH_OFF_BYTES = (0xFF, 0xFF)   # rows disabled -> no LED has a current path
+FLASH_ENABLED    = True
+FLASH_RED_GPIO   = 22      # BCM numbering; physical pin 15
+FLASH_GREEN_GPIO = 23      # BCM numbering; physical pin 16
+FLASH_BLUE_GPIO  = 24      # BCM numbering; physical pin 18
+FLASH_SETTLE     = 0.4     # seconds the light is on before capture, so
+                           # auto-exposure adapts to the lit scene
 
 # ----------------------------------------------------------------------------
 # IMAGE QUALITY KNOBS
@@ -257,58 +254,54 @@ def prepare_image(img):
 
 
 # ----------------------------------------------------------------------------
-# FLASH (Adeept 8x8 matrix, two cascaded 74HC595s)
+# FLASH (Adeept common-anode RGB LED)
 # ----------------------------------------------------------------------------
 
 class Flash:
-    """Brute-force all-on flash for an Adeept 74HC595 8x8 matrix. Shifts two
-    bytes out via SPI; spidev's CS line (CE0) acts as the 595 latch (ST_CP)
-    on its rising edge after each transfer. Degrades to no-op if spidev isn't
-    available so the rest of the program keeps working.
-
-    Static all-on runs the row chip's total package current ~50% over the
-    74HC595's 70 mA rating. Safe for short bursts during testing; not safe
-    for prolonged or continuous use."""
+    """Adeept common-anode RGB LED used as a small white flash. Each cathode
+    is driven by a GPIO with inverted polarity (active_high=False): LED.on()
+    pulls the cathode LOW so current flows; LED.off() drives it HIGH (3.3 V)
+    which sits below the LED forward voltage with 5 V on the anode, so the
+    LED is fully off with no leakage. Degrades to no-op if gpiozero isn't
+    available."""
 
     def __init__(self):
-        self.spi = None
+        self.pins = ()
         if not FLASH_ENABLED:
             return
         try:
-            import spidev
-            self.spi = spidev.SpiDev()
-            self.spi.open(FLASH_SPI_PORT, FLASH_SPI_DEV)
-            self.spi.max_speed_hz = FLASH_SPI_HZ
-            self.spi.mode = 0
-            self.off()
+            from gpiozero import LED
+            self.pins = (
+                LED(FLASH_RED_GPIO,   active_high=False, initial_value=False),
+                LED(FLASH_GREEN_GPIO, active_high=False, initial_value=False),
+                LED(FLASH_BLUE_GPIO,  active_high=False, initial_value=False),
+            )
         except Exception as e:
-            print(f"Flash disabled (SPI not available): {e}")
-            self.spi = None
-
-    def _send(self, bytes_pair):
-        try:
-            self.spi.xfer2([bytes_pair[0], bytes_pair[1]])
-        except Exception:
-            pass
+            print(f"Flash disabled (gpiozero not available): {e}")
+            self.pins = ()
 
     def on(self):
-        if self.spi is None:
-            return
-        self._send(FLASH_ON_BYTES)
+        for pin in self.pins:
+            try:
+                pin.on()
+            except Exception:
+                pass
 
     def off(self):
-        if self.spi is None:
-            return
-        self._send(FLASH_OFF_BYTES)
+        for pin in self.pins:
+            try:
+                pin.off()
+            except Exception:
+                pass
 
     def close(self):
         self.off()
-        if self.spi is not None:
+        for pin in self.pins:
             try:
-                self.spi.close()
+                pin.close()
             except Exception:
                 pass
-        self.spi = None
+        self.pins = ()
 
 
 # ----------------------------------------------------------------------------
