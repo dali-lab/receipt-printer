@@ -344,7 +344,7 @@ class Flash:
 # CAPTION
 # ----------------------------------------------------------------------------
 
-CAPTION_TEXT    = "Technigala 26S"
+CAPTION_TEXT    = "Technigala 26F"
 CAPTION_FONT_SIZE = 24          # px; Press Start 2P is 8-px grid so multiples of 8 look sharpest
 CAPTION_PADDING = 18            # px of white space above and below the text row
 CAPTION_FONT_URL = (

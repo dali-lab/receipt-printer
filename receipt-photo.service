@@ -1,26 +1,29 @@
 [Unit]
 Description=Button-triggered receipt photo printer
 # Wait until the system is fully up and USB devices have enumerated
-After=multi-user.target
+After=multi-user.target network-online.target
 
 [Service]
 Type=simple
 
-# --- EDIT THESE THREE LINES to match your username and paths ---
 User=dali
-# Use the venv's python if you made one; otherwise just /usr/bin/python3
-ExecStart=/home/dali/Desktop/receipt-printer/.venv/bin/python /home/dali/Desktop/receipt-printer/receipt_photo.py
-WorkingDirectory=/home/dali
-# ---------------------------------------------------------------
 
-# Give USB/camera a moment to be ready before starting (optional but helps)
-ExecStartPre=/bin/sleep 5
+WorkingDirectory=/home/dali
+
+# pull latest git changes
+ExecStartPre=-/usr/bin/git -C /home/dali/Desktop/receipt-printer pull --ff-only
+# sleep to warm up camera
+ExecStartPre=/bin/sleep 3
+
+# launch the application
+ExecStart=/home/dali/Desktop/receipt-printer/.venv/bin/python /home/dali/Desktop/receipt-printer/receipt_photo.py
+
 
 # Restart automatically if it crashes
 Restart=on-failure
 RestartSec=3
 
-# Send the script's print() output to the journal so you can debug it
+# send output to journal for debugging
 StandardOutput=journal
 StandardError=journal
 
