@@ -4,7 +4,7 @@ receipt_photo.py
 ----------------
 Press a button -> LED-matrix flash fires -> Pi Camera takes a photo ->
 the photo is tone-mapped and dithered for a 1-bit thermal head ->
-printed on an Epson TM-T88V (USB).
+printed on an Epson TM-T88V (Ethernet, falling back to USB).
 
 Quality pipeline:
   grayscale -> resize -> CLAHE (adaptive local equalization) ->
@@ -58,6 +58,14 @@ from PIL import Image, ImageOps, ImageFilter
 PRINTER_VENDOR_ID  = 0x04b8
 PRINTER_PRODUCT_ID = 0x0202
 PRINTER_PROFILE    = "TM-T88V"
+
+# Ethernet (primary). USB above is the fallback when this isn't reachable.
+# Set PRINTER_HOST to the static IP you gave the UB-E03 card.
+# Override without editing: PRINTER_HOST=192.168.x.y python3 receipt_photo.py
+import os
+PRINTER_HOST       = os.environ.get("PRINTER_HOST", "192.168.1.250")
+PRINTER_PORT       = 9100
+NETWORK_TIMEOUT    = 2.0      # seconds to wait before falling back to USB
 
 PRINT_WIDTH = 512          # 180-dpi head = 512 printable dots
 FEED_LINES_AFTER = 3
@@ -404,8 +412,24 @@ def make_caption_strip(width):
 # ----------------------------------------------------------------------------
 
 def get_printer():
-    from escpos.printer import Usb
+    """Ethernet first; fall back to USB if the printer isn't reachable."""
+    import socket
+    from escpos.printer import Network, Usb
     kwargs = {"profile": PRINTER_PROFILE} if PRINTER_PROFILE else {}
+
+    if PRINTER_HOST:
+        # Quick probe so an unplugged/unreachable printer fails fast.
+        try:
+            with socket.create_connection((PRINTER_HOST, PRINTER_PORT),
+                                          timeout=NETWORK_TIMEOUT):
+                pass
+            print(f"Printing via Ethernet ({PRINTER_HOST}:{PRINTER_PORT})")
+            return Network(PRINTER_HOST, port=PRINTER_PORT,
+                           timeout=NETWORK_TIMEOUT * 5, **kwargs)
+        except OSError as e:
+            print(f"Ethernet unavailable ({e}); falling back to USB")
+
+    print("Printing via USB")
     return Usb(PRINTER_VENDOR_ID, PRINTER_PRODUCT_ID, **kwargs)
 
 
