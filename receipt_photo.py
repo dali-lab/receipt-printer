@@ -63,7 +63,7 @@ PRINTER_PROFILE    = "TM-T88V"
 # Set PRINTER_HOST to the static IP you gave the UB-E03 card.
 # Override without editing: PRINTER_HOST=192.168.x.y python3 receipt_photo.py
 import os
-PRINTER_HOST       = os.environ.get("PRINTER_HOST", "192.168.1.250")
+PRINTER_HOST       = os.environ.get("PRINTER_HOST", "")
 PRINTER_PORT       = 9100
 NETWORK_TIMEOUT    = 2.0      # seconds to wait before falling back to USB
 
